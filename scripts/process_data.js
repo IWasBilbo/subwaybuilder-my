@@ -34,6 +34,54 @@ const POPULATION_GROUP_CONFIG = {
     : 24,
 };
 
+const DISTANCE_WEIGHTING = {
+  smallThreshold: Number.isFinite(config.distanceWeighting?.smallThreshold)
+    ? config.distanceWeighting.smallThreshold
+    : 300,
+  mediumThreshold: Number.isFinite(config.distanceWeighting?.mediumThreshold)
+    ? config.distanceWeighting.mediumThreshold
+    : 1200,
+  largeThreshold: Number.isFinite(config.distanceWeighting?.largeThreshold)
+    ? config.distanceWeighting.largeThreshold
+    : 4000,
+  megaThreshold: Number.isFinite(config.distanceWeighting?.megaThreshold)
+    ? config.distanceWeighting.megaThreshold
+    : 10000,
+  smallScaleKm: Number.isFinite(config.distanceWeighting?.smallScaleKm)
+    ? config.distanceWeighting.smallScaleKm
+    : 2.5,
+  mediumScaleKm: Number.isFinite(config.distanceWeighting?.mediumScaleKm)
+    ? config.distanceWeighting.mediumScaleKm
+    : 3.8,
+  largeScaleKm: Number.isFinite(config.distanceWeighting?.largeScaleKm)
+    ? config.distanceWeighting.largeScaleKm
+    : 5.5,
+  megaScaleKm: Number.isFinite(config.distanceWeighting?.megaScaleKm)
+    ? config.distanceWeighting.megaScaleKm
+    : 7.5,
+  extremeScaleKm: Number.isFinite(config.distanceWeighting?.extremeScaleKm)
+    ? config.distanceWeighting.extremeScaleKm
+    : 9.5,
+  distanceExponent: Number.isFinite(config.distanceWeighting?.distanceExponent)
+    ? config.distanceWeighting.distanceExponent
+    : 1.8,
+  jobExponent: Number.isFinite(config.distanceWeighting?.jobExponent)
+    ? config.distanceWeighting.jobExponent
+    : 0.55,
+  clusterExponent: Number.isFinite(config.distanceWeighting?.clusterExponent)
+    ? config.distanceWeighting.clusterExponent
+    : 0.35,
+  minDistanceKm: Number.isFinite(config.distanceWeighting?.minDistanceKm)
+    ? config.distanceWeighting.minDistanceKm
+    : 0.3,
+  closenessFloor: Number.isFinite(config.distanceWeighting?.closenessFloor)
+    ? config.distanceWeighting.closenessFloor
+    : 0.005,
+  closenessPower: Number.isFinite(config.distanceWeighting?.closenessPower)
+    ? config.distanceWeighting.closenessPower
+    : 1.3,
+};
+
 const roundNumber = (value) => {
   if (OUTPUT_DECIMAL_PLACES === null) return value;
   if (typeof value !== 'number') return value;
@@ -170,6 +218,34 @@ const splitConnectionIntoGroups = (size, residenceId, jobId) => {
   }
 
   return sizes;
+};
+
+const distanceScaleForPopulation = (population) => {
+  if (population < DISTANCE_WEIGHTING.smallThreshold) return DISTANCE_WEIGHTING.smallScaleKm;
+  if (population < DISTANCE_WEIGHTING.mediumThreshold) return DISTANCE_WEIGHTING.mediumScaleKm;
+  if (population < DISTANCE_WEIGHTING.largeThreshold) return DISTANCE_WEIGHTING.largeScaleKm;
+  if (population < DISTANCE_WEIGHTING.megaThreshold) return DISTANCE_WEIGHTING.megaScaleKm;
+  return DISTANCE_WEIGHTING.extremeScaleKm;
+};
+
+const computeConnectionMetrics = (outerPlace, innerPlace, distanceMeters) => {
+  const distanceKm = Math.max(DISTANCE_WEIGHTING.minDistanceKm, distanceMeters / 1000);
+  const distanceScale = distanceScaleForPopulation(outerPlace.totalPopulation);
+  const closenessRaw = 1 / (1 + Math.pow(distanceKm / distanceScale, DISTANCE_WEIGHTING.distanceExponent));
+  const closeness = Math.max(
+    DISTANCE_WEIGHTING.closenessFloor,
+    closenessRaw
+  );
+  const jobScore = Math.pow(innerPlace.totalJobs + 1, DISTANCE_WEIGHTING.jobExponent);
+  const clusterBoost = Math.pow(
+    Math.max(innerPlace.percentOfTotalJobs, 1e-6),
+    DISTANCE_WEIGHTING.clusterExponent
+  );
+
+  return {
+    weight: jobScore * clusterBoost * Math.pow(closeness, DISTANCE_WEIGHTING.closenessPower),
+    closeness,
+  };
 };
 
 const optimizeBuilding = (unOptimizedBuilding) => {
@@ -739,10 +815,13 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
           centersOfNeighborhoods[innerPlace.placeID],
         ]);
         const connectionDistance = turf.length(connectionLine, { units: 'meters' });
+        const { weight, closeness } = computeConnectionMetrics(outerPlace, innerPlace, connectionDistance);
         return {
           residenceId: outerPlace.placeID,
           jobId: innerPlace.placeID,
-          weight: innerPlace.percentOfTotalJobs,
+          weight,
+          closeness,
+          distanceMeters: connectionDistance,
           drivingDistance: Math.round(connectionDistance),
           drivingSeconds: Math.round(connectionDistance * 0.12),
         };
@@ -750,10 +829,32 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
 
     if (!connectionCandidates.length) return;
 
-    connectionCandidates.sort((a, b) => b.weight - a.weight);
-    const limitedCandidates = POPULATION_GROUP_CONFIG.maxConnectionsPerPoint
-      ? connectionCandidates.slice(0, POPULATION_GROUP_CONFIG.maxConnectionsPerPoint)
-      : connectionCandidates;
+    const maxConnections = POPULATION_GROUP_CONFIG.maxConnectionsPerPoint
+      ? Math.min(POPULATION_GROUP_CONFIG.maxConnectionsPerPoint, connectionCandidates.length)
+      : connectionCandidates.length;
+
+    const localQuota = (() => {
+      if (maxConnections <= 0) return 0;
+      if (totalPop < DISTANCE_WEIGHTING.smallThreshold) return Math.min(6, maxConnections);
+      if (totalPop < DISTANCE_WEIGHTING.mediumThreshold) return Math.min(5, maxConnections);
+      if (totalPop < DISTANCE_WEIGHTING.largeThreshold) return Math.min(4, maxConnections);
+      return Math.min(3, maxConnections);
+    })();
+
+    const byDistance = [...connectionCandidates].sort((a, b) => a.distanceMeters - b.distanceMeters);
+    const byWeight = [...connectionCandidates].sort((a, b) => b.weight - a.weight);
+    const selectedMap = new Map();
+
+    byDistance.slice(0, localQuota).forEach((candidate) => {
+      if (!selectedMap.has(candidate.jobId)) selectedMap.set(candidate.jobId, candidate);
+    });
+
+    for (const candidate of byWeight) {
+      if (selectedMap.size >= maxConnections) break;
+      if (!selectedMap.has(candidate.jobId)) selectedMap.set(candidate.jobId, candidate);
+    }
+
+    const limitedCandidates = Array.from(selectedMap.values());
 
     let weightSum = limitedCandidates.reduce((sum, candidate) => sum + candidate.weight, 0);
     if (!weightSum || weightSum <= 0) weightSum = limitedCandidates.length;
@@ -771,47 +872,59 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
     let remaining = totalPop - assigned;
     if (remaining < 0) remaining = 0;
 
-    rawConnections.sort((a, b) => b.remainder - a.remainder);
+    rawConnections.sort((a, b) => (b.remainder * b.closeness) - (a.remainder * a.closeness));
 
     for (let i = 0; remaining > 0 && rawConnections.length > 0; i++, remaining--) {
       rawConnections[i % rawConnections.length].baseSize += 1;
     }
 
     if (POPULATION_GROUP_CONFIG.minimumFinalizeSize) {
-      const eligibleConnections = rawConnections.filter((conn) => conn.baseSize > 0);
-      if (eligibleConnections.length > 1) {
-        let carry = 0;
-        eligibleConnections.forEach((conn) => {
-          if (conn.baseSize < POPULATION_GROUP_CONFIG.minimumFinalizeSize) {
-            carry += conn.baseSize;
-            conn.baseSize = 0;
-          }
+      const nearestSelected = byDistance
+        .filter((candidate) => selectedMap.has(candidate.jobId))
+        .slice(0, localQuota)
+        .map((candidate) => rawConnections.find((conn) => conn.jobId === candidate.jobId))
+        .filter(Boolean);
+
+      nearestSelected.forEach((candidate) => {
+        if (candidate.baseSize > 0) return;
+        const donor = rawConnections
+          .filter((conn) => conn.baseSize > POPULATION_GROUP_CONFIG.minimumFinalizeSize)
+          .sort((a, b) => a.closeness - b.closeness)[0];
+        if (donor) {
+          donor.baseSize -= 1;
+          candidate.baseSize += 1;
+        }
+      });
+
+      const distanceBuckets = rawConnections
+        .filter((conn) => conn.baseSize > 0)
+        .sort((a, b) => a.distanceMeters - b.distanceMeters);
+
+      let accumulator = [];
+      let accumulatorSize = 0;
+
+      const finalizeBucket = () => {
+        if (!accumulator.length) return;
+        const target = accumulator.reduce((best, current) =>
+          current.closeness > best.closeness ? current : best
+        , accumulator[0]);
+        target.baseSize = accumulatorSize;
+        accumulator.forEach((conn) => {
+          if (conn !== target) conn.baseSize = 0;
         });
+        accumulator = [];
+        accumulatorSize = 0;
+      };
 
-        const donors = eligibleConnections
-          .filter((conn) => conn.baseSize >= POPULATION_GROUP_CONFIG.minimumFinalizeSize)
-          .sort((a, b) => b.baseSize - a.baseSize);
-
-        if (!donors.length && carry > 0) {
-          const largest = eligibleConnections.sort((a, b) => b.baseSize - a.baseSize)[0];
-          if (largest) {
-            largest.baseSize += carry;
-            carry = 0;
-          }
+      distanceBuckets.forEach((conn) => {
+        accumulator.push(conn);
+        accumulatorSize += conn.baseSize;
+        if (accumulatorSize >= POPULATION_GROUP_CONFIG.minimumFinalizeSize) {
+          finalizeBucket();
         }
+      });
 
-        let donorIndex = 0;
-        while (carry > 0 && donors.length) {
-          donors[donorIndex].baseSize += 1;
-          carry -= 1;
-          donorIndex = (donorIndex + 1) % donors.length;
-        }
-
-        if (carry > 0) {
-          const fallback = eligibleConnections.find((conn) => conn.baseSize === 0);
-          if (fallback) fallback.baseSize += carry;
-        }
-      }
+      if (accumulator.length) finalizeBucket();
     }
 
     rawConnections.forEach((conn) => {
