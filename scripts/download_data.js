@@ -60,6 +60,16 @@ const getStreetName = (tags, preferLocale = 'en') => {
 };
 
 const fetchRoadData = async (bbox) => {
+  const latSpan = bbox[2] - bbox[0];
+  const lonSpan = bbox[3] - bbox[1];
+  const latPadding = latSpan * 0.1;
+  const lonPadding = lonSpan * 0.1;
+  const expandedBbox = [
+    bbox[0] - latPadding,
+    bbox[1] - lonPadding,
+    bbox[2] + latPadding,
+    bbox[3] + lonPadding,
+  ];
   const roadQuery = `
 [out:json][timeout:180];
 (
