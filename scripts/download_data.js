@@ -3,49 +3,103 @@ import { createParseStream, createStringifyStream } from 'big-json';
 import { Readable } from "stream";
 import config from '../config.js';
 
+const OVERPASS_ENDPOINTS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+  "https://overpass.openstreetmap.ru/cgi/interpreter",
+  "https://overpass.openstreetmap.fr/api/interpreter",
+];
+
+const REQUEST_TIMEOUT_MS = 10000; // Abort slow mirrors
+
 const convertBbox = (bbox) => [bbox[1], bbox[0], bbox[3], bbox[2]];
 
-const runQuery = async (query) => {
-  const res = await fetch("https://overpass-api.de/api/interpreter", {
-    "credentials": "omit",
-    "headers": {
-      "User-Agent": "SubwayBuilder-Patcher (https://github.com/piemadd/subwaybuilder-patcher)",
-      "Accept": "*/*",
-      "Accept-Language": "en-US,en;q=0.5"
-    },
-    "body": `data=${encodeURIComponent(query)}`,
-    "method": "POST",
-    "mode": "cors"
-  });
+const fetchWithTimeout = async (endpoint, query) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
-  if (!res.ok) {
-    console.log('Error fetching data, try again in ~30 seconds');
-    process.exit(1);
-  };
+  try {
+    return await fetch(endpoint, {
+      "credentials": "omit",
+      "headers": {
+        "User-Agent": "SubwayBuilder-Patcher (https://github.com/piemadd/subwaybuilder-patcher)",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.5"
+      },
+      "body": `data=${encodeURIComponent(query)}`,
+      "method": "POST",
+      "mode": "cors",
+      "signal": controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+};
 
+const parseJsonStream = (response) => new Promise((resolve, reject) => {
+  const parseStream = createParseStream();
   let finalData = null;
 
-  const parseStream = createParseStream();
-  Readable.fromWeb(res.body).pipe(parseStream);
+  if (!response.body) {
+    reject(new Error('missing response body'));
+    return;
+  }
 
-
-  // Listen for parsed objects
   parseStream.on('data', (data) => {
     finalData = data;
   });
+  parseStream.on('end', () => resolve(finalData));
+  parseStream.on('error', reject);
 
-  parseStream.on('error', (error) => {
-    console.error('Error parsing JSON stream:', error);
-    console.log('Error fetching data, try again in ~30 seconds');
-    process.exit(1);
-  });
+  try {
+    Readable.fromWeb(response.body).pipe(parseStream);
+  } catch (err) {
+    reject(err);
+  }
+});
 
-  await new Promise((resolve, reject) => {
-    parseStream.on('end', resolve);
-    parseStream.on('error', reject);
-  });
+const runQueryAgainstEndpoint = async (endpoint, query) => {
+  console.log(`Querying Overpass mirror: ${endpoint}`);
 
-  return finalData;
+  let res;
+  try {
+    res = await fetchWithTimeout(endpoint, query);
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error(`request timed out after ${REQUEST_TIMEOUT_MS / 1000}s`);
+    }
+    throw error;
+  }
+
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  }
+
+  try {
+    return await parseJsonStream(res);
+  } catch (error) {
+    throw new Error(`failed to parse response: ${error.message}`);
+  }
+};
+
+const runQuery = async (query) => {
+  let lastError = null;
+
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    try {
+      return await runQueryAgainstEndpoint(endpoint, query);
+    } catch (error) {
+      lastError = error;
+      console.warn(`Mirror failed (${endpoint}): ${error.message}`);
+    }
+  }
+
+  console.error('All Overpass mirrors failed.');
+  if (lastError) {
+    console.error(lastError);
+  }
+  console.log('Error fetching data, try again in ~30 seconds');
+  process.exit(1);
 };
 
 const getStreetName = (tags, preferLocale = 'en') => {
