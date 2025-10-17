@@ -3,6 +3,175 @@ import config from '../config.js';
 import * as turf from '@turf/turf';
 import { createParseStream } from 'big-json';
 
+const OUTPUT_DECIMAL_PLACES = Number.isFinite(config.outputPrecision?.decimals)
+  ? config.outputPrecision.decimals
+  : null;
+
+const ROAD_FILTERS = {
+  excludeHighways: config.roadFilters?.excludeHighways
+    ? new Set(config.roadFilters.excludeHighways)
+    : null,
+  minLengthMeters: Number.isFinite(config.roadFilters?.minLengthMeters)
+    ? config.roadFilters.minLengthMeters
+    : null,
+};
+// configure your own population groups at demand points, base game targets ~20 pops
+const POPULATION_GROUP_CONFIG = {
+  targetSize: Number.isFinite(config.populationChunking?.targetSize)
+    ? config.populationChunking.targetSize
+    : 160,
+  minSize: Number.isFinite(config.populationChunking?.minSize)
+    ? config.populationChunking.minSize
+    : 20,
+  minimumFinalizeSize: Number.isFinite(config.populationChunking?.minimumFinalizeSize)
+    ? config.populationChunking.minimumFinalizeSize
+    : 30,
+  maxSize: Number.isFinite(config.populationChunking?.maxSize)
+    ? config.populationChunking.maxSize
+    : 380,
+  maxConnectionsPerPoint: Number.isFinite(config.populationChunking?.maxConnectionsPerPoint)
+    ? config.populationChunking.maxConnectionsPerPoint
+    : 24,
+};
+
+const roundNumber = (value) => {
+  if (OUTPUT_DECIMAL_PLACES === null) return value;
+  if (typeof value !== 'number') return value;
+  if (!Number.isFinite(value)) return value;
+  if (Number.isInteger(value)) return value;
+  return Number(value.toFixed(OUTPUT_DECIMAL_PLACES));
+};
+
+const writeJson = (filePath, data) => {
+  const replacer = OUTPUT_DECIMAL_PLACES === null
+    ? null
+    : (_, value) => roundNumber(value);
+  fs.writeFileSync(filePath, JSON.stringify(data, replacer), { encoding: 'utf8' });
+};
+
+const hashString = (input) => {
+  let hash = 0;
+  for (let i = 0; i < input.length; i++) {
+    hash = (hash * 31 + input.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash);
+};
+
+const splitConnectionIntoGroups = (size, residenceId, jobId) => {
+  if (!size || size <= 0) return [];
+  if (!POPULATION_GROUP_CONFIG.maxSize || size <= POPULATION_GROUP_CONFIG.minSize) return [size];
+
+  const minGroupCount = Math.max(1, Math.ceil(size / POPULATION_GROUP_CONFIG.maxSize));
+  const maxGroupCount = Math.max(
+    minGroupCount,
+    POPULATION_GROUP_CONFIG.minSize > 0
+      ? Math.floor(size / POPULATION_GROUP_CONFIG.minSize)
+      : size
+  );
+
+  let groupCount = Math.max(minGroupCount, Math.round(size / POPULATION_GROUP_CONFIG.targetSize));
+  if (groupCount > maxGroupCount) groupCount = maxGroupCount;
+  if (groupCount < 1) groupCount = 1;
+
+  let baseSize = Math.floor(size / groupCount);
+  while (groupCount > 1 && baseSize < POPULATION_GROUP_CONFIG.minSize) {
+    groupCount -= 1;
+    baseSize = Math.floor(size / groupCount);
+  }
+
+  let sizes = new Array(groupCount).fill(baseSize);
+  let remainder = size - baseSize * groupCount;
+  if (remainder < 0) remainder = 0;
+
+  if (sizes.length) {
+    const hash = hashString(`${residenceId}-${jobId}`);
+    for (let i = 0; remainder > 0; i++, remainder--) {
+      const index = (hash + i) % sizes.length;
+      sizes[index] += 1;
+    }
+  }
+
+  if (POPULATION_GROUP_CONFIG.maxSize) {
+    const adjusted = [];
+    sizes.forEach((value) => {
+      if (value <= POPULATION_GROUP_CONFIG.maxSize) {
+        adjusted.push(value);
+        return;
+      }
+      let remainingValue = value;
+      while (remainingValue > POPULATION_GROUP_CONFIG.maxSize) {
+        adjusted.push(POPULATION_GROUP_CONFIG.maxSize);
+        remainingValue -= POPULATION_GROUP_CONFIG.maxSize;
+      }
+      if (remainingValue > 0) adjusted.push(remainingValue);
+    });
+    sizes = adjusted;
+  }
+
+  if (POPULATION_GROUP_CONFIG.minSize && sizes.length > 1) {
+    for (let i = 0; i < sizes.length; i++) {
+      if (sizes[i] >= POPULATION_GROUP_CONFIG.minSize) continue;
+      const neighborIndex = i === 0 ? 1 : i - 1;
+      if (neighborIndex < sizes.length) {
+        sizes[neighborIndex] += sizes[i];
+        sizes.splice(i, 1);
+        i -= 1;
+      }
+    }
+  }
+
+  if (POPULATION_GROUP_CONFIG.minimumFinalizeSize && sizes.length > 1) {
+    const sorted = [...sizes].sort((a, b) => a - b);
+    const merged = [];
+    let accumulator = 0;
+
+    sorted.forEach((value) => {
+      if (value >= POPULATION_GROUP_CONFIG.minimumFinalizeSize) {
+        if (accumulator > 0) {
+          merged.push(accumulator);
+          accumulator = 0;
+        }
+        merged.push(value);
+      } else {
+        accumulator += value;
+        if (accumulator >= POPULATION_GROUP_CONFIG.minimumFinalizeSize) {
+          merged.push(accumulator);
+          accumulator = 0;
+        }
+      }
+    });
+
+    if (accumulator > 0) {
+      if (merged.length) {
+        merged[merged.length - 1] += accumulator;
+      } else {
+        merged.push(accumulator);
+      }
+    }
+
+    sizes = merged;
+  }
+
+  if (POPULATION_GROUP_CONFIG.maxSize) {
+    const adjusted = [];
+    sizes.forEach((value) => {
+      if (value <= POPULATION_GROUP_CONFIG.maxSize) {
+        adjusted.push(value);
+        return;
+      }
+      let remainingValue = value;
+      while (remainingValue > POPULATION_GROUP_CONFIG.maxSize) {
+        adjusted.push(POPULATION_GROUP_CONFIG.maxSize);
+        remainingValue -= POPULATION_GROUP_CONFIG.maxSize;
+      }
+      if (remainingValue > 0) adjusted.push(remainingValue);
+    });
+    sizes = adjusted;
+  }
+
+  return sizes;
+};
+
 const optimizeBuilding = (unOptimizedBuilding) => {
   return {
     b: [unOptimizedBuilding.minX, unOptimizedBuilding.minY, unOptimizedBuilding.maxX, unOptimizedBuilding.maxY],
@@ -555,39 +724,118 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
     }
   });
 
-  Object.values(finalVoronoiMetadata).forEach((outerPlace) => {
-    // trust the process bro
-    Object.values(finalVoronoiMetadata).forEach((innerPlace) => {
-      //const connectionSizeBasedOnResidencePercent = outerPlace.percentOfTotalPopulation * innerPlace.totalJobs;
-      const connectionSizeBasedOnJobsPercent = innerPlace.percentOfTotalJobs * outerPlace.totalPopulation;
-      const connectionDistance = turf.length(turf.lineString([
-        centersOfNeighborhoods[outerPlace.placeID],
-        centersOfNeighborhoods[innerPlace.placeID],
-      ]), { units: 'meters' });
-      const conncetionSeconds = connectionDistance * 0.12; // very scientific (hey, this is something i got from the subwaybuilder data)
-      neighborhoodConnections.push({
-        residenceId: outerPlace.placeID,
-        jobId: innerPlace.placeID,
-        size: Math.round(connectionSizeBasedOnJobsPercent), // SO MANY VIBES EVERYTHING IS JUST VIBES FUCK IT WE BALL
-        drivingDistance: Math.round(connectionDistance),
-        drivingSeconds: Math.round(conncetionSeconds),
-      })
+  const placeEntries = Object.values(finalVoronoiMetadata);
+  let connectionCounter = 0;
+
+  placeEntries.forEach((outerPlace) => {
+    const totalPop = Math.round(outerPlace.totalPopulation);
+    if (!totalPop || totalPop <= 0) return;
+
+    const connectionCandidates = placeEntries
+      .filter((innerPlace) => innerPlace.totalJobs > 0)
+      .map((innerPlace) => {
+        const connectionLine = turf.lineString([
+          centersOfNeighborhoods[outerPlace.placeID],
+          centersOfNeighborhoods[innerPlace.placeID],
+        ]);
+        const connectionDistance = turf.length(connectionLine, { units: 'meters' });
+        return {
+          residenceId: outerPlace.placeID,
+          jobId: innerPlace.placeID,
+          weight: innerPlace.percentOfTotalJobs,
+          drivingDistance: Math.round(connectionDistance),
+          drivingSeconds: Math.round(connectionDistance * 0.12),
+        };
+      });
+
+    if (!connectionCandidates.length) return;
+
+    connectionCandidates.sort((a, b) => b.weight - a.weight);
+    const limitedCandidates = POPULATION_GROUP_CONFIG.maxConnectionsPerPoint
+      ? connectionCandidates.slice(0, POPULATION_GROUP_CONFIG.maxConnectionsPerPoint)
+      : connectionCandidates;
+
+    let weightSum = limitedCandidates.reduce((sum, candidate) => sum + candidate.weight, 0);
+    if (!weightSum || weightSum <= 0) weightSum = limitedCandidates.length;
+
+    const rawConnections = limitedCandidates.map((candidate) => {
+      const rawSize = (candidate.weight / weightSum) * totalPop;
+      return {
+        ...candidate,
+        baseSize: Math.floor(rawSize),
+        remainder: rawSize - Math.floor(rawSize),
+      };
+    });
+
+    let assigned = rawConnections.reduce((sum, conn) => sum + conn.baseSize, 0);
+    let remaining = totalPop - assigned;
+    if (remaining < 0) remaining = 0;
+
+    rawConnections.sort((a, b) => b.remainder - a.remainder);
+
+    for (let i = 0; remaining > 0 && rawConnections.length > 0; i++, remaining--) {
+      rawConnections[i % rawConnections.length].baseSize += 1;
+    }
+
+    if (POPULATION_GROUP_CONFIG.minimumFinalizeSize) {
+      const eligibleConnections = rawConnections.filter((conn) => conn.baseSize > 0);
+      if (eligibleConnections.length > 1) {
+        let carry = 0;
+        eligibleConnections.forEach((conn) => {
+          if (conn.baseSize < POPULATION_GROUP_CONFIG.minimumFinalizeSize) {
+            carry += conn.baseSize;
+            conn.baseSize = 0;
+          }
+        });
+
+        const donors = eligibleConnections
+          .filter((conn) => conn.baseSize >= POPULATION_GROUP_CONFIG.minimumFinalizeSize)
+          .sort((a, b) => b.baseSize - a.baseSize);
+
+        if (!donors.length && carry > 0) {
+          const largest = eligibleConnections.sort((a, b) => b.baseSize - a.baseSize)[0];
+          if (largest) {
+            largest.baseSize += carry;
+            carry = 0;
+          }
+        }
+
+        let donorIndex = 0;
+        while (carry > 0 && donors.length) {
+          donors[donorIndex].baseSize += 1;
+          carry -= 1;
+          donorIndex = (donorIndex + 1) % donors.length;
+        }
+
+        if (carry > 0) {
+          const fallback = eligibleConnections.find((conn) => conn.baseSize === 0);
+          if (fallback) fallback.baseSize += carry;
+        }
+      }
+    }
+
+    rawConnections.forEach((conn) => {
+      if (conn.baseSize <= 0) return;
+      const groupSizes = splitConnectionIntoGroups(conn.baseSize, conn.residenceId, conn.jobId);
+      groupSizes.forEach((groupSize) => {
+        const id = (connectionCounter++).toString();
+        if (finalNeighborhoods[conn.jobId]) {
+          finalNeighborhoods[conn.jobId].popIds.push(id);
+        }
+        if (finalNeighborhoods[conn.residenceId]) {
+          finalNeighborhoods[conn.residenceId].popIds.push(id);
+        }
+        neighborhoodConnections.push({
+          residenceId: conn.residenceId,
+          jobId: conn.jobId,
+          size: groupSize,
+          drivingDistance: conn.drivingDistance,
+          drivingSeconds: conn.drivingSeconds,
+          id,
+        });
+      });
     });
   });
-
-  // need to populate popIds within finalNeighborhoods
-  neighborhoodConnections = neighborhoodConnections
-    .filter((connection) => {
-      return connection.size > 0;
-    })
-    .map((connection, i) => {
-      const id = i.toString();
-      finalNeighborhoods[connection.jobId].popIds.push(id);
-      return {
-        ...connection,
-        id,
-      }
-    });
 
   return {
     points: Object.values(finalNeighborhoods),
@@ -741,6 +989,41 @@ const processBuildings = (place, rawBuildings) => {
   return optimizedIndex;
 }
 
+const shouldKeepRoadFeature = (feature) => {
+  if (!feature?.geometry) return false;
+  if (ROAD_FILTERS.excludeHighways?.size) {
+    const highwayType = feature.properties?.highway;
+    if (highwayType && ROAD_FILTERS.excludeHighways.has(highwayType)) {
+      return false;
+    }
+  }
+
+  if (ROAD_FILTERS.minLengthMeters && ROAD_FILTERS.minLengthMeters > 0) {
+    try {
+      if (feature.geometry.type === 'LineString' || feature.geometry.type === 'MultiLineString') {
+        const length = turf.length(feature, { units: 'meters' });
+        if (length < ROAD_FILTERS.minLengthMeters) return false;
+      }
+    } catch (err) {
+      // ignore length calculation issues; keep the feature
+    }
+  }
+
+  return true;
+};
+
+const processRoads = (place) => {
+  const roadFilePath = `./raw_data/${place.code}/roads.geojson`;
+  if (!fs.existsSync(roadFilePath)) return null;
+
+  const roadGeoJson = JSON.parse(fs.readFileSync(roadFilePath, 'utf8'));
+  if (!roadGeoJson?.features) return roadGeoJson;
+
+  roadGeoJson.features = roadGeoJson.features.filter((feature) => shouldKeepRoadFeature(feature));
+
+  return roadGeoJson;
+};
+
 const processAllData = async (place) => {
   const readJsonFile = (filePath) => {
     return new Promise((resolve, reject) => {
@@ -771,11 +1054,15 @@ const processAllData = async (place) => {
   const processedBuildings = processBuildings(place, rawBuildings);
   console.log('Processing Connections/Demand for', place.code)
   const processedConnections = processPlaceConnections(place, rawBuildings, rawPlaces);
+  console.log('Processing Roads for', place.code)
+  const processedRoads = processRoads(place);
 
   console.log('Writing finished data for', place.code)
-  fs.writeFileSync(`./processed_data/${place.code}/buildings_index.json`, JSON.stringify(processedBuildings), { encoding: 'utf8' });
-  fs.cpSync(`./raw_data/${place.code}/roads.geojson`, `./processed_data/${place.code}/roads.geojson`);
-  fs.writeFileSync(`./processed_data/${place.code}/demand_data.json`, JSON.stringify(processedConnections), { encoding: 'utf8' });
+  writeJson(`./processed_data/${place.code}/buildings_index.json`, processedBuildings);
+  if (processedRoads) {
+    writeJson(`./processed_data/${place.code}/roads.geojson`, processedRoads);
+  }
+  writeJson(`./processed_data/${place.code}/demand_data.json`, processedConnections);
 };
 
 if (!fs.existsSync('./processed_data')) fs.mkdirSync('./processed_data');
