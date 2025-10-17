@@ -49,19 +49,19 @@ const DISTANCE_WEIGHTING = {
     : 10000,
   smallScaleKm: Number.isFinite(config.distanceWeighting?.smallScaleKm)
     ? config.distanceWeighting.smallScaleKm
-    : 2.5,
+    : 1.6,
   mediumScaleKm: Number.isFinite(config.distanceWeighting?.mediumScaleKm)
     ? config.distanceWeighting.mediumScaleKm
-    : 3.8,
+    : 2.5,
   largeScaleKm: Number.isFinite(config.distanceWeighting?.largeScaleKm)
     ? config.distanceWeighting.largeScaleKm
-    : 5.5,
+    : 3.8,
   megaScaleKm: Number.isFinite(config.distanceWeighting?.megaScaleKm)
     ? config.distanceWeighting.megaScaleKm
-    : 7.5,
+    : 6,
   extremeScaleKm: Number.isFinite(config.distanceWeighting?.extremeScaleKm)
     ? config.distanceWeighting.extremeScaleKm
-    : 9.5,
+    : 8.5,
   distanceExponent: Number.isFinite(config.distanceWeighting?.distanceExponent)
     ? config.distanceWeighting.distanceExponent
     : 1.8,
@@ -79,7 +79,7 @@ const DISTANCE_WEIGHTING = {
     : 0.005,
   closenessPower: Number.isFinite(config.distanceWeighting?.closenessPower)
     ? config.distanceWeighting.closenessPower
-    : 1.3,
+    : 1.1,
 };
 
 const roundNumber = (value) => {
@@ -275,72 +275,72 @@ const optimizeIndex = (unOptimizedIndex) => {
 // then multiply that but the total number of floors to get an approximate full square footage number
 // i can then divide by the below number to get a rough populaion stat
 const squareFeetPerPopulation = {
-  yes: 600, // most likely a SFH
-  apartments: 240,
-  barracks: 100, // google said 70-90, but imma bump it up a bit tbh
-  bungalow: 600, // sfh
-  cabin: 600, // sfh
-  detached: 600, // sfh
-  annexe: 240, // kinda like apartments
-  dormitory: 125, // good lord
-  farm: 600, // sfh
-  ger: 240, // technically sfh, but generally usually smaller and more compact. honorary apartment. TIL "ger" is mongolian for the english word "yurt"
-  hotel: 240, // gonna count these as apartments because hotel guests use transit too
-  house: 600, // sfh
-  houseboat: 600, // interdasting
-  residential: 600, // could be anything, but im assuimg sfh here
-  semidetached_house: 400, // duplex
+  yes: 450, // most likely a SFH
+  apartments: 450,
+  barracks: 150, // google said 70-90, but imma bump it up a bit tbh
+  bungalow: 750, // sfh
+  cabin: 750, // sfh
+  detached: 750, // sfh
+  annexe: 600, // kinda like apartments
+  dormitory: 200, // good lord
+  farm: 800, // sfh
+  ger: 300, // technically sfh, but generally usually smaller and more compact. honorary apartment. TIL "ger" is mongolian for the english word "yurt"
+  hotel: 350, // gonna count these as apartments because hotel guests use transit too
+  house: 750, // sfh
+  houseboat: 650, // interesting
+  residential: 450, // could be anything, but let's align with apartments
+  semidetached_house: 550, // duplex
   static_caravan: 500,
-  stilt_house: 600,
-  terrace: 500, // townhome
-  tree_house: 240, // fuck it
-  trullo: 240, // there is nothing scientific here, its all fucking vibes
+  stilt_house: 800,
+  terrace: 550, // townhome
+  tree_house: 300, // fuck it
+  trullo: 300, // there is nothing scientific here, its all fucking vibes
 };
 
 const squareFeetPerJob = {
-  commercial: 150, // non specific, restaraunts i guess?
-  industrial: 500, // vibes vibes vibes vibes!!!!!,
-  kiosk: 50, // its all vibes baby
-  office: 150, // all of my vibes are 100% meat created
-  retail: 300,
+  commercial: 350, // non specific, restaraunts i guess?
+  industrial: 400, // vibes vibes vibes vibes!!!!!,
+  kiosk: 150, // its all vibes baby
+  office: 175, // all of my vibes are 100% meat created
+  retail: 500,
   supermarket: 300,
-  warehouse: 500,
+  warehouse: 600,
   // the following are all religious and im assuming ~100 square feet, not for job purposes, 
   // but for the fact that people go to religious institutions
   // might use a similar trick for sports stadiums
-  religious: 100,
-  cathedral: 100,
-  chapel: 100,
-  church: 100,
-  kingdom_hall: 100,
-  monastery: 100,
-  mosque: 100,
-  presbytery: 100,
-  shrine: 100,
-  synagogue: 100,
-  temple: 100,
+  religious: 200,
+  cathedral: 200,
+  chapel: 200,
+  church: 200,
+  kingdom_hall: 200,
+  monastery: 200,
+  mosque: 200,
+  presbytery: 200,
+  shrine: 200,
+  synagogue: 200,
+  temple: 200,
   // end of religious
   bakehouse: 300,
-  college: 250, // collge/uni is a job
-  fire_station: 500,
-  government: 150,
-  gatehouse: 150,
-  hospital: 150,
-  kindergarten: 100,
+  college: 200, // collge/uni is a job
+  fire_station: 400,
+  government: 175,
+  gatehouse: 200,
+  hospital: 125,
+  kindergarten: 200,
   museum: 300,
   public: 300,
-  school: 100,
+  school: 175,
   train_station: 1000,
   transportation: 1000,
-  university: 250,
+  university: 200,
   // sports time! im going to treat these like offices because i said so.
   // i think itll end up creating demand thats on average what stadiums see traffic wise. not sure
-  grandstand: 150,
-  pavilion: 150,
-  riding_hall: 150,
-  sports_hall: 150,
-  sports_centre: 150,
-  stadium: 150,
+  grandstand: 200,
+  pavilion: 200,
+  riding_hall: 200,
+  sports_hall: 200,
+  sports_centre: 200,
+  stadium: 200,
 };
 
 const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
@@ -835,10 +835,10 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
 
     const localQuota = (() => {
       if (maxConnections <= 0) return 0;
-      if (totalPop < DISTANCE_WEIGHTING.smallThreshold) return Math.min(6, maxConnections);
-      if (totalPop < DISTANCE_WEIGHTING.mediumThreshold) return Math.min(5, maxConnections);
-      if (totalPop < DISTANCE_WEIGHTING.largeThreshold) return Math.min(4, maxConnections);
-      return Math.min(3, maxConnections);
+      if (totalPop < DISTANCE_WEIGHTING.smallThreshold) return Math.min(4, maxConnections);
+      if (totalPop < DISTANCE_WEIGHTING.mediumThreshold) return Math.min(3, maxConnections);
+      if (totalPop < DISTANCE_WEIGHTING.largeThreshold) return Math.min(2, maxConnections);
+      return Math.min(2, maxConnections);
     })();
 
     const byDistance = [...connectionCandidates].sort((a, b) => a.distanceMeters - b.distanceMeters);
@@ -896,35 +896,28 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
         }
       });
 
-      const distanceBuckets = rawConnections
-        .filter((conn) => conn.baseSize > 0)
-        .sort((a, b) => a.distanceMeters - b.distanceMeters);
+      let activeConnections = rawConnections.filter((conn) => conn.baseSize > 0);
+      const minSize = POPULATION_GROUP_CONFIG.minimumFinalizeSize;
 
-      let accumulator = [];
-      let accumulatorSize = 0;
+      while (activeConnections.length > 1) {
+        const victim = activeConnections.find((conn) => conn.baseSize < minSize);
+        if (!victim) break;
 
-      const finalizeBucket = () => {
-        if (!accumulator.length) return;
-        const target = accumulator.reduce((best, current) =>
-          current.closeness > best.closeness ? current : best
-        , accumulator[0]);
-        target.baseSize = accumulatorSize;
-        accumulator.forEach((conn) => {
-          if (conn !== target) conn.baseSize = 0;
-        });
-        accumulator = [];
-        accumulatorSize = 0;
-      };
+        const recipient = activeConnections
+          .filter((conn) => conn !== victim)
+          .sort((a, b) => {
+            const distanceDeltaA = Math.abs(a.distanceMeters - victim.distanceMeters);
+            const distanceDeltaB = Math.abs(b.distanceMeters - victim.distanceMeters);
+            if (distanceDeltaA !== distanceDeltaB) return distanceDeltaA - distanceDeltaB;
+            return b.closeness - a.closeness;
+          })[0];
 
-      distanceBuckets.forEach((conn) => {
-        accumulator.push(conn);
-        accumulatorSize += conn.baseSize;
-        if (accumulatorSize >= POPULATION_GROUP_CONFIG.minimumFinalizeSize) {
-          finalizeBucket();
-        }
-      });
+        if (!recipient) break;
 
-      if (accumulator.length) finalizeBucket();
+        recipient.baseSize += victim.baseSize;
+        victim.baseSize = 0;
+        activeConnections = activeConnections.filter((conn) => conn.baseSize > 0);
+      }
     }
 
     rawConnections.forEach((conn) => {
