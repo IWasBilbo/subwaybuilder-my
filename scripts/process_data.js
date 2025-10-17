@@ -103,33 +103,67 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
   let centersOfNeighborhoods = {};
   let calculatedBuildings = {};
 
-  // finding areas of neighborhoods
-  rawPlaces.forEach((place) => {
-    if (place.tags.place && (place.tags.place == 'quarter' || place.tags.place == 'neighbourhood')) {
-      neighborhoods[place.id] = place;
-      if (place.type == 'node') {
-        centersOfNeighborhoods[place.id] = [place.lon, place.lat];
-      } else if (place.type == 'way' || place.type == 'relation') {
-        const center = [(place.bounds.minlon + place.bounds.maxlon) / 2, (place.bounds.minlat + place.bounds.maxlat) / 2];
-        centersOfNeighborhoods[place.id] = center;
-      }
+  const basePlaceTypes = new Set(['quarter', 'neighbourhood']);
+  const sprawlPlaceTypes = new Set(['suburb', 'town', 'village', 'hamlet', 'isolated_dwelling', 'locality', 'residential', 'city']);
+  const ruralCandidates = [];
+  const clusterDistanceByPlaceType = {
+    isolated_dwelling: 0.35,
+    hamlet: 0.45,
+    village: 0.6,
+    town: 0.8,
+    suburb: 0.75,
+    residential: 0.7,
+    locality: 0.5,
+    neighbourhood: 0.45,
+    quarter: 0.5,
+    city: 0.9,
+  };
+  const ruralRadiusByPlaceType = {
+    isolated_dwelling: 1,
+    hamlet: 1.25,
+    village: 2,
+    town: 3,
+    suburb: 2.5,
+    residential: 2.25,
+    locality: 1.5,
+    neighbourhood: 1.75,
+    quarter: 2,
+    city: 4,
+  };
+  const orphanCellSizeDegrees = 0.01;
+  const orphanPopulationThreshold = 25;
+  const orphanAdoptionThreshold = 0.9; // km
+  const orphanInitialClusterDistance = 0.6;
+  const maxClusterPopulation = 7500;
+  const minClusterSplitDistance = 0.15;
+
+  const computePlaceCenter = (placeFeature) => {
+    if (placeFeature.type == 'node') return [placeFeature.lon, placeFeature.lat];
+    if ((placeFeature.type == 'way' || placeFeature.type == 'relation') && placeFeature.bounds) {
+      return [
+        (placeFeature.bounds.minlon + placeFeature.bounds.maxlon) / 2,
+        (placeFeature.bounds.minlat + placeFeature.bounds.maxlat) / 2,
+      ];
+    }
+    return null;
+  };
+
+  const directPlaces = [];
+
+  // finding areas of neighborhoods and separating candidates that need splitting
+  rawPlaces.forEach((placeFeature) => {
+    if (!placeFeature.tags?.place) return;
+    const placeType = placeFeature.tags.place;
+
+    if (basePlaceTypes.has(placeType)) {
+      directPlaces.push(placeFeature);
+      return;
+    }
+
+    if (sprawlPlaceTypes.has(placeType)) {
+      ruralCandidates.push(placeFeature);
     }
   });
-
-  const centersOfNeighborhoodsFeatureCollection = turf.featureCollection(
-    Object.keys(centersOfNeighborhoods).map((placeID) =>
-      turf.point(centersOfNeighborhoods[placeID], {
-        placeID,
-        name: neighborhoods[placeID].tags.name,
-      })
-    )
-  );
-
-  // splitting everything into areas
-  const voronoi = turf.voronoi(centersOfNeighborhoodsFeatureCollection, {
-    bbox: place.bbox,
-  })
-  voronoi.features = voronoi.features.filter((feature) => feature);
 
   // sorting buildings between residential and commercial
   rawBuildings.forEach((building) => {
@@ -161,6 +195,314 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
       }
     }
   });
+
+  const residentialBuildingPoints = turf.featureCollection(
+    Object.values(calculatedBuildings)
+      .filter((building) => (building.approxPop ?? 0) > 0)
+      .map((building) =>
+        turf.point(building.buildingCenter, {
+          buildingID: building.id,
+          approxPop: building.approxPop,
+        })
+      )
+  );
+
+  const getBuildingsForPlace = (placeFeature) => {
+    if (!residentialBuildingPoints.features.length) return [];
+
+    const placeType = placeFeature.tags?.place;
+
+    if ((placeFeature.type == 'way' || placeFeature.type == 'relation') && placeFeature.geometry?.length >= 3) {
+      const ring = placeFeature.geometry.map((coord) => [coord.lon, coord.lat]);
+      if (ring[0][0] !== ring[ring.length - 1][0] || ring[0][1] !== ring[ring.length - 1][1]) ring.push(ring[0]);
+      const polygon = turf.polygon([ring]);
+      return residentialBuildingPoints.features.filter((feature) => turf.booleanPointInPolygon(feature, polygon));
+    }
+
+    if (placeFeature.bounds) {
+      return residentialBuildingPoints.features.filter((feature) => {
+        const [lon, lat] = feature.geometry.coordinates;
+        return (
+          lon >= placeFeature.bounds.minlon &&
+          lon <= placeFeature.bounds.maxlon &&
+          lat >= placeFeature.bounds.minlat &&
+          lat <= placeFeature.bounds.maxlat
+        );
+      });
+    }
+
+    const center = computePlaceCenter(placeFeature);
+    if (!center) return [];
+
+    const radius = ruralRadiusByPlaceType[placeType] ?? 2;
+    const centerPoint = turf.point(center);
+    return residentialBuildingPoints.features.filter((feature) => turf.distance(centerPoint, feature, { units: 'kilometers' }) <= radius);
+  };
+
+  let syntheticClusterCounter = 0;
+
+  const addCenterFromFeature = (placeFeature, centerCoords, nameSuffix) => {
+    const baseId = placeFeature.id?.toString?.() ?? `place-${syntheticClusterCounter}`;
+    const syntheticId = nameSuffix ? `${baseId}-${nameSuffix}` : baseId;
+
+    neighborhoods[syntheticId] = {
+      ...placeFeature,
+      id: syntheticId,
+      tags: {
+        ...placeFeature.tags,
+        ...(nameSuffix
+          ? {
+              name: placeFeature.tags?.name
+                ? `${placeFeature.tags.name} ${nameSuffix}`
+                : nameSuffix,
+              'subwaybuilder:synthetic': 'true',
+            }
+          : {}),
+      },
+    };
+    centersOfNeighborhoods[syntheticId] = centerCoords;
+    syntheticClusterCounter += 1;
+  };
+
+  const deriveNameFromBuildings = (buildingFeatures) => {
+    const nameScores = {};
+    buildingFeatures.forEach((feature) => {
+      const building = calculatedBuildings[feature.properties.buildingID];
+      if (!building?.tags) return;
+      const tags = building.tags;
+      const candidates = [
+        tags['addr:city'],
+        tags['addr:town'],
+        tags['addr:village'],
+        tags['addr:hamlet'],
+        tags['addr:suburb'],
+        tags['addr:place'],
+      ].filter(Boolean);
+      if (!candidates.length && tags.name) candidates.push(tags.name);
+      const weight = building.approxPop ?? 1;
+      candidates.forEach((candidate) => {
+        nameScores[candidate] = (nameScores[candidate] || 0) + weight;
+      });
+    });
+
+    const sorted = Object.entries(nameScores).sort((a, b) => b[1] - a[1]);
+    return sorted.length ? sorted[0][0] : null;
+  };
+
+  const organizeDbscanGroups = (features) => {
+    const groups = {};
+    features.forEach((feature) => {
+      const clusterId = feature.properties.cluster;
+      const key = clusterId !== undefined && clusterId !== null && clusterId !== -1
+        ? clusterId
+        : `noise-${feature.properties.buildingID}`;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(feature);
+    });
+    return Object.values(groups);
+  };
+
+  const splitLargeClusterIfNeeded = (groupFeatures, baseDistance, depth = 0) => {
+    const totalPop = groupFeatures.reduce((sum, feature) => sum + (feature.properties?.approxPop ?? 0), 0);
+    if (totalPop <= maxClusterPopulation || groupFeatures.length < 3 || baseDistance <= minClusterSplitDistance) {
+      if (totalPop > maxClusterPopulation && groupFeatures.length >= 2 && baseDistance <= minClusterSplitDistance) {
+        const lons = groupFeatures.map((feature) => feature.geometry.coordinates[0]);
+        const lats = groupFeatures.map((feature) => feature.geometry.coordinates[1]);
+        const lonRange = Math.max(...lons) - Math.min(...lons);
+        const latRange = Math.max(...lats) - Math.min(...lats);
+        const sortAxis = lonRange >= latRange ? 0 : 1;
+        const sorted = [...groupFeatures].sort((a, b) => a.geometry.coordinates[sortAxis] - b.geometry.coordinates[sortAxis]);
+        const mid = Math.ceil(sorted.length / 2);
+        const left = sorted.slice(0, mid);
+        const right = sorted.slice(mid);
+        if (left.length && right.length) {
+          return [
+            ...splitLargeClusterIfNeeded(left, baseDistance, depth + 1),
+            ...splitLargeClusterIfNeeded(right, baseDistance, depth + 1),
+          ];
+        }
+      }
+      return [groupFeatures];
+    }
+
+    const nextDistance = Math.max(baseDistance * 0.7, minClusterSplitDistance);
+    const subClustered = turf.clustersDbscan(
+      turf.featureCollection(groupFeatures),
+      nextDistance,
+      { minPoints: 1, units: 'kilometers' }
+    );
+    const subGroups = organizeDbscanGroups(subClustered.features);
+
+    if (subGroups.length === 1 && subGroups[0].length === groupFeatures.length) {
+      return [groupFeatures];
+    }
+
+    return subGroups.flatMap((subGroup) => splitLargeClusterIfNeeded(subGroup, nextDistance, depth + 1));
+  };
+
+  const clusterPlaceFeature = (placeFeature) => {
+    const placeType = placeFeature.tags?.place;
+    const placeDistance = clusterDistanceByPlaceType[placeType] ?? 0.6;
+    const placeBuildings = getBuildingsForPlace(placeFeature);
+
+    if (!placeBuildings.length) {
+      const center = computePlaceCenter(placeFeature);
+      if (center) addCenterFromFeature(placeFeature, center);
+      return;
+    }
+
+    const totalPlacePopulation = placeBuildings.reduce((sum, feature) => sum + (feature.properties?.approxPop ?? 0), 0);
+    if (totalPlacePopulation === 0) {
+      const center = computePlaceCenter(placeFeature);
+      if (center) addCenterFromFeature(placeFeature, center);
+      return;
+    }
+
+    const clustered = turf.clustersDbscan(
+      turf.featureCollection(placeBuildings),
+      placeDistance,
+      { minPoints: 1, units: 'kilometers' }
+    );
+
+    const groups = organizeDbscanGroups(clustered.features)
+      .filter((group) => group.length);
+
+    const finalGroups = groups.flatMap((group) => splitLargeClusterIfNeeded(group, placeDistance))
+      .filter((group) => group.length && group.reduce((sum, feature) => sum + (feature.properties?.approxPop ?? 0), 0) > 0);
+
+    if (!finalGroups.length) {
+      const center = computePlaceCenter(placeFeature);
+      if (center) addCenterFromFeature(placeFeature, center);
+      return;
+    }
+
+    finalGroups.forEach((finalGroup, index) => {
+      const centerPoint = turf.centerOfMass(turf.featureCollection(finalGroup));
+      const useSuffix = finalGroups.length > 1;
+      const clusterLabel = useSuffix ? `Cluster ${index + 1}` : null;
+
+      addCenterFromFeature(
+        placeFeature,
+        centerPoint.geometry.coordinates,
+        clusterLabel
+      );
+    });
+  };
+
+  directPlaces.forEach((placeFeature) => clusterPlaceFeature(placeFeature));
+  ruralCandidates.forEach((placeFeature) => clusterPlaceFeature(placeFeature));
+
+  const centerPoints = Object.entries(centersOfNeighborhoods).map(([placeID, coords]) =>
+    turf.point(coords, { placeID })
+  );
+
+  const addSyntheticOrphanClusters = () => {
+    if (!residentialBuildingPoints.features.length) return;
+
+    const orphanCells = {};
+
+    residentialBuildingPoints.features.forEach((feature) => {
+      const [lon, lat] = feature.geometry.coordinates;
+      const approxPop = feature.properties?.approxPop ?? 0;
+      const lonKey = Math.floor(lon / orphanCellSizeDegrees);
+      const latKey = Math.floor(lat / orphanCellSizeDegrees);
+      const cellKey = `${lonKey}:${latKey}`;
+      if (!orphanCells[cellKey]) {
+        orphanCells[cellKey] = {
+          features: [],
+          population: 0,
+          lonSum: 0,
+          latSum: 0,
+        };
+      }
+      orphanCells[cellKey].features.push(feature);
+      orphanCells[cellKey].population += approxPop;
+      const weight = approxPop || 1;
+      orphanCells[cellKey].lonSum += lon * weight;
+      orphanCells[cellKey].latSum += lat * weight;
+    });
+
+    const candidateCells = Object.values(orphanCells)
+      .map((cell) => {
+        const totalWeight = cell.population || cell.features.length;
+        return {
+          ...cell,
+          center: [
+            cell.lonSum / totalWeight,
+            cell.latSum / totalWeight,
+          ],
+        };
+      })
+      .filter((cell) => cell.population >= orphanPopulationThreshold);
+
+    candidateCells.sort((a, b) => b.population - a.population);
+
+    candidateCells.forEach((cell) => {
+      const centerPoint = turf.point(cell.center);
+      let minDistance = Infinity;
+      centerPoints.forEach((centerFeature) => {
+        const distance = turf.distance(centerPoint, centerFeature, { units: 'kilometers' });
+        if (distance < minDistance) minDistance = distance;
+      });
+
+      if (centerPoints.length && minDistance <= orphanAdoptionThreshold) return;
+
+      const splitGroups = splitLargeClusterIfNeeded(cell.features, orphanInitialClusterDistance);
+
+      splitGroups.forEach((group) => {
+        if (!group.length) return;
+        const groupPopulation = group.reduce((sum, feature) => sum + (feature.properties?.approxPop ?? 0), 0);
+        if (groupPopulation === 0) return;
+
+        const clusterCenter = turf.centerOfMass(turf.featureCollection(group));
+        const derivedName = deriveNameFromBuildings(group);
+        const syntheticId = `synthetic-${syntheticClusterCounter}`;
+        neighborhoods[syntheticId] = {
+          type: 'synthetic',
+          id: syntheticId,
+          tags: {
+            name: derivedName ?? `Synthetic Cluster ${syntheticClusterCounter}`,
+            'subwaybuilder:synthetic': 'true',
+            'subwaybuilder:cluster-source': 'orphan-residential',
+          },
+        };
+        centersOfNeighborhoods[syntheticId] = clusterCenter.geometry.coordinates;
+        centerPoints.push(turf.point(clusterCenter.geometry.coordinates, { placeID: syntheticId }));
+        syntheticClusterCounter += 1;
+      });
+    });
+  };
+
+  addSyntheticOrphanClusters();
+
+  if (Object.keys(centersOfNeighborhoods).length === 0) {
+    const fallbackBuilding = Object.values(calculatedBuildings)[0];
+    if (!fallbackBuilding) return { points: [], pops: [] };
+
+    neighborhoods['generated-cluster'] = {
+      id: 'generated-cluster',
+      tags: {
+        name: 'Generated Cluster',
+        'subwaybuilder:synthetic': 'true',
+      },
+    };
+    centersOfNeighborhoods['generated-cluster'] = fallbackBuilding.buildingCenter;
+  }
+
+  const centersOfNeighborhoodsFeatureCollection = turf.featureCollection(
+    Object.keys(centersOfNeighborhoods).map((placeID) =>
+      turf.point(centersOfNeighborhoods[placeID], {
+        placeID,
+        name: neighborhoods[placeID]?.tags?.name,
+      })
+    )
+  );
+
+  // splitting everything into areas
+  const voronoi = turf.voronoi(centersOfNeighborhoodsFeatureCollection, {
+    bbox: place.bbox,
+  })
+  voronoi.features = voronoi.features.filter((feature) => feature);
 
   // so we can do like, stuff with it
   const buildingsAsFeatureCollection = turf.featureCollection(
