@@ -63,12 +63,19 @@ const fetchRoadData = async (bbox) => {
   const roadQuery = `
 [out:json][timeout:180];
 (
-  way["highway"="motorway"](${bbox.join(',')});
-  way["highway"="trunk"](${bbox.join(',')});
-  way["highway"="primary"](${bbox.join(',')});
-  way["highway"="secondary"](${bbox.join(',')});
-  way["highway"="tertiary"](${bbox.join(',')});
-  way["highway"="residential"](${bbox.join(',')});
+  way["highway"="motorway"](${expandedBbox.join(',')});
+  way["highway"="motorway_link"](${expandedBbox.join(',')});
+  way["highway"="trunk"](${expandedBbox.join(',')});
+  way["highway"="trunk_link"](${expandedBbox.join(',')});
+  way["highway"="primary"](${expandedBbox.join(',')});
+  way["highway"="primary_link"](${expandedBbox.join(',')});
+  way["highway"="secondary"](${expandedBbox.join(',')});
+  way["highway"="secondary_link"](${expandedBbox.join(',')});
+  way["highway"="tertiary"](${expandedBbox.join(',')});
+  way["highway"="tertiary_link"](${expandedBbox.join(',')});
+  way["highway"="residential"](${expandedBbox.join(',')});
+  way["highway"="unclassified"](${expandedBbox.join(',')});
+  way["highway"="road"](${expandedBbox.join(',')});
 );
 out geom;`
 
@@ -76,11 +83,18 @@ out geom;`
 
   const roadTypes = {
     motorway: 'highway',
+    motorway_link: 'highway',
     trunk: 'major',
+    trunk_link: 'major',
     primary: 'major',
+    primary_link: 'major',
     secondary: 'minor',
+    secondary_link: 'minor',
     tertiary: 'minor',
+    tertiary_link: 'minor',
     residential: 'minor',
+    unclassified: 'minor',
+    road: 'minor',
   };
 
   return {
@@ -93,9 +107,9 @@ out geom;`
         structure: "normal",
         name: getStreetName(element.tags, (config.locale || 'en')),
          },
-            "geometry": {
-            "coordinates": element.geometry.map((coord) => [coord.lon, coord.lat]),
-            "type": "LineString"
+  "geometry": {
+    "coordinates": element.geometry.map((coord) => [coord.lon, coord.lat]),
+    "type": "LineString"
        }
       }
     })
