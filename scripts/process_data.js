@@ -3,6 +3,8 @@ import config from '../config.js';
 import * as turf from '@turf/turf';
 import { createParseStream } from 'big-json';
 
+let terminalTicker = 0;
+
 const OUTPUT_DECIMAL_PLACES = Number.isFinite(config.outputPrecision?.decimals)
   ? config.outputPrecision.decimals
   : null;
@@ -80,6 +82,24 @@ const DISTANCE_WEIGHTING = {
   closenessPower: Number.isFinite(config.distanceWeighting?.closenessPower)
     ? config.distanceWeighting.closenessPower
     : 1.1,
+  terminalWeightMultiplier: Number.isFinite(config.distanceWeighting?.terminalWeightMultiplier)
+    ? config.distanceWeighting.terminalWeightMultiplier
+    : 1.2,
+  terminalClosenessExponent: Number.isFinite(config.distanceWeighting?.terminalClosenessExponent)
+    ? config.distanceWeighting.terminalClosenessExponent
+    : 1.1,
+  baseWeight: Number.isFinite(config.distanceWeighting?.baseWeight)
+    ? config.distanceWeighting.baseWeight
+    : 0.02,
+  terminalMaxShare: Number.isFinite(config.distanceWeighting?.terminalMaxShare)
+    ? config.distanceWeighting.terminalMaxShare
+    : 0.01,
+  terminalMinShare: Number.isFinite(config.distanceWeighting?.terminalMinShare)
+    ? config.distanceWeighting.terminalMinShare
+    : 0.0003,
+  globalTerminalShare: Number.isFinite(config.distanceWeighting?.globalTerminalShare)
+    ? config.distanceWeighting.globalTerminalShare
+    : 0.004,
 };
 
 const roundNumber = (value) => {
@@ -228,11 +248,93 @@ const distanceScaleForPopulation = (population) => {
   return DISTANCE_WEIGHTING.extremeScaleKm;
 };
 
+const normalizeIataCode = (value) => {
+  if (!value) return null;
+  const cleaned = value.toString().trim().toUpperCase();
+  if (!cleaned) return null;
+  if (/^[A-Z0-9]{3}$/u.test(cleaned)) return cleaned;
+  if (/^[A-Z0-9]{4}$/u.test(cleaned)) return cleaned.slice(0, 3);
+  return null;
+};
+
+const extractIataCode = (tags = {}) => {
+  const candidates = [
+    tags.iata,
+    tags['ref:iata'],
+    tags['iata:code'],
+    tags['airport:iata'],
+    tags.ref,
+  ];
+  for (const candidate of candidates) {
+    const normalized = normalizeIataCode(candidate);
+    if (normalized) return normalized;
+  }
+  return null;
+};
+
+const findNearestAerodrome = (centerCoords, aerodromes) => {
+  if (!aerodromes.length) return null;
+  const centerPoint = turf.point(centerCoords);
+  let best = null;
+  let bestDistance = Infinity;
+  aerodromes.forEach((aerodrome) => {
+    if (!aerodrome.center) return;
+    const distance = turf.distance(centerPoint, turf.point(aerodrome.center), { units: 'kilometers' });
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = { ...aerodrome, distance };
+    }
+  });
+  if (best && best.distance <= 80) return best;
+  return null;
+};
+
+const determineTerminalLabel = (placeFeature, centerCoords, aerodromes, terminalNameCountersRef) => {
+  const tags = placeFeature.tags ?? {};
+  let code = extractIataCode(tags);
+  let airportName = tags.name || tags['name:en'];
+
+  if (!code || !airportName) {
+    const nearest = findNearestAerodrome(centerCoords, aerodromes);
+    if (nearest) {
+      if (!code) code = extractIataCode(nearest.tags);
+      if (!airportName) airportName = nearest.tags?.name || nearest.tags?.['name:en'];
+    }
+  }
+
+  const baseKey = code ?? airportName ?? 'Terminal';
+  terminalNameCountersRef[baseKey] = (terminalNameCountersRef[baseKey] || 0) + 1;
+  const sequence = terminalNameCountersRef[baseKey];
+  const internalId = `AIR_Terminal_${terminalTicker}`;
+  terminalTicker += 1;
+
+  let name = null;
+  if (code) {
+    name = sequence > 1 ? `${code} Terminal ${sequence}` : `${code} Terminal 1`;
+  } else if (airportName) {
+    if (/terminal/i.test(airportName)) {
+      name = sequence > 1 ? `${airportName} ${sequence}` : airportName;
+    } else {
+      name = `${airportName} Terminal ${sequence}`;
+    }
+  } else {
+    name = `Terminal ${sequence}`;
+  }
+
+  return {
+    internalId,
+    name,
+    iata: code || null,
+    groupKey: baseKey,
+    sequence,
+  };
+};
+
 const computeConnectionMetrics = (outerPlace, innerPlace, distanceMeters) => {
   const distanceKm = Math.max(DISTANCE_WEIGHTING.minDistanceKm, distanceMeters / 1000);
   const distanceScale = distanceScaleForPopulation(outerPlace.totalPopulation);
   const closenessRaw = 1 / (1 + Math.pow(distanceKm / distanceScale, DISTANCE_WEIGHTING.distanceExponent));
-  const closeness = Math.max(
+  let closeness = Math.max(
     DISTANCE_WEIGHTING.closenessFloor,
     closenessRaw
   );
@@ -241,9 +343,18 @@ const computeConnectionMetrics = (outerPlace, innerPlace, distanceMeters) => {
     Math.max(innerPlace.percentOfTotalJobs, 1e-6),
     DISTANCE_WEIGHTING.clusterExponent
   );
+  let closenessPower = DISTANCE_WEIGHTING.closenessPower;
+  let weight = jobScore * clusterBoost;
+
+  if (innerPlace.isTerminal) {
+    closenessPower = Math.min(closenessPower, DISTANCE_WEIGHTING.terminalClosenessExponent);
+    weight *= DISTANCE_WEIGHTING.terminalWeightMultiplier;
+  }
+
+  const adjustedWeight = weight * Math.pow(closeness, closenessPower) + DISTANCE_WEIGHTING.baseWeight;
 
   return {
-    weight: jobScore * clusterBoost * Math.pow(closeness, DISTANCE_WEIGHTING.closenessPower),
+    weight: adjustedWeight,
     closeness,
   };
 };
@@ -351,6 +462,12 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
   const basePlaceTypes = new Set(['quarter', 'neighbourhood']);
   const sprawlPlaceTypes = new Set(['suburb', 'town', 'village', 'hamlet', 'isolated_dwelling', 'locality', 'residential', 'city']);
   const ruralCandidates = [];
+  const terminalPlaces = [];
+  const aerodromePlaces = [];
+  const terminalLabelMapping = {};
+  const terminalMetaByPlace = {};
+  const terminalMetaByDisplay = {};
+  const terminalNameCounters = {};
   const clusterDistanceByPlaceType = {
     isolated_dwelling: 0.35,
     hamlet: 0.45,
@@ -408,15 +525,39 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
 
   // finding areas of neighborhoods and separating candidates that need splitting
   rawPlaces.forEach((placeFeature) => {
-    if (!placeFeature.tags?.place) return;
-    const placeType = placeFeature.tags.place;
+    const placeType = placeFeature.tags?.place;
+    const isTerminal = placeFeature.tags?.aeroway === 'terminal';
+    const isAerodrome = placeFeature.tags?.aeroway === 'aerodrome';
 
-    if (basePlaceTypes.has(placeType)) {
+    if (isTerminal) {
+      const terminalFeature = {
+        ...placeFeature,
+        tags: {
+          ...placeFeature.tags,
+          'subwaybuilder:is_terminal': 'true',
+        },
+      };
+      terminalPlaces.push(terminalFeature);
+      return;
+    }
+
+    if (isAerodrome) {
+      const center = computePlaceCenter(placeFeature);
+      if (center) {
+        aerodromePlaces.push({
+          ...placeFeature,
+          center,
+        });
+      }
+      return;
+    }
+
+    if (placeType && basePlaceTypes.has(placeType)) {
       directPlaces.push(placeFeature);
       return;
     }
 
-    if (sprawlPlaceTypes.has(placeType)) {
+    if (placeType && sprawlPlaceTypes.has(placeType)) {
       ruralCandidates.push(placeFeature);
     }
   });
@@ -441,8 +582,19 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
           buildingCenter,
         };
       } else if (squareFeetPerJob[building.tags.building]) { // commercial/jobs
-        const approxJobs = Math.floor(buildingArea / squareFeetPerJob[building.tags.building]);
+        let approxJobs = Math.floor(buildingArea / squareFeetPerJob[building.tags.building]);
 
+        if (building.tags.aeroway && building.tags.aeroway === 'terminal') {
+          approxJobs = Math.max(Math.floor(buildingArea / 320) * 3, 120);
+        }
+
+        calculatedBuildings[building.id] = {
+          ...building,
+          approxJobs,
+          buildingCenter,
+        };
+      } else if (building.tags.aeroway === 'terminal') {
+        const approxJobs = Math.max(Math.floor(buildingArea / 320) * 3, 120);
         calculatedBuildings[building.id] = {
           ...building,
           approxJobs,
@@ -467,6 +619,7 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
     if (!residentialBuildingPoints.features.length) return [];
 
     const placeType = placeFeature.tags?.place;
+    const isTerminal = placeFeature.tags?.aeroway === 'terminal';
 
     if ((placeFeature.type == 'way' || placeFeature.type == 'relation') && placeFeature.geometry?.length >= 3) {
       const ring = placeFeature.geometry.map((coord) => [coord.lon, coord.lat]);
@@ -490,7 +643,9 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
     const center = computePlaceCenter(placeFeature);
     if (!center) return [];
 
-    const radius = ruralRadiusByPlaceType[placeType] ?? 2;
+    const radius = isTerminal
+      ? 1.2
+      : (ruralRadiusByPlaceType[placeType] ?? 2);
     const centerPoint = turf.point(center);
     return residentialBuildingPoints.features.filter((feature) => turf.distance(centerPoint, feature, { units: 'kilometers' }) <= radius);
   };
@@ -655,6 +810,25 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
 
   directPlaces.forEach((placeFeature) => clusterPlaceFeature(placeFeature));
   ruralCandidates.forEach((placeFeature) => clusterPlaceFeature(placeFeature));
+  terminalPlaces.forEach((placeFeature) => {
+    const center = computePlaceCenter(placeFeature);
+    if (!center) return;
+    const terminalInfo = determineTerminalLabel(placeFeature, center, aerodromePlaces, terminalNameCounters);
+    const terminalId = addCenterFromFeature(placeFeature, center);
+    if (terminalId) {
+      terminalLabelMapping[terminalId] = terminalInfo;
+      if (placeFeature.id) terminalLabelMapping[placeFeature.id.toString()] = terminalInfo;
+      terminalMetaByPlace[placeFeature.id?.toString?.() ?? terminalId] = terminalInfo;
+      if (!neighborhoods[terminalId].tags) neighborhoods[terminalId].tags = {};
+      neighborhoods[terminalId].tags.name = terminalInfo.name;
+      if (terminalInfo.iata) neighborhoods[terminalId].tags.iata = terminalInfo.iata;
+      neighborhoods[terminalId].tags['subwaybuilder:is_terminal'] = 'true';
+      neighborhoods[terminalId].id = terminalInfo.internalId;
+      terminalMetaByDisplay[terminalInfo.internalId] = terminalInfo;
+    }
+    const nearbyResidential = getBuildingsForPlace(placeFeature);
+    nearbyResidential.forEach((feature) => coveredBuildingIDs.add(feature.properties.buildingID));
+  });
 
   const centerPoints = Object.entries(centersOfNeighborhoods).map(([placeID, coords]) =>
     turf.point(coords, { placeID })
@@ -827,10 +1001,10 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
       const [lon, lat] = building.buildingCenter;
       const approxPop = building.approxPop ?? 0;
       const approxJobs = building.approxJobs ?? 0;
-      finalFeature.totalPopulation += (building.approxPop ?? 0);
-      finalFeature.totalJobs += (building.approxJobs ?? 0);
-      totalPopulation += (building.approxPop ?? 0);
-      totalJobs += (building.approxJobs ?? 0);
+      finalFeature.totalPopulation += approxPop;
+      finalFeature.totalJobs += approxJobs;
+      totalPopulation += approxPop;
+      totalJobs += approxJobs;
       if (approxPop > 0) {
         residentWeightLon += lon * approxPop;
         residentWeightLat += lat * approxPop;
@@ -856,13 +1030,15 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
       ];
     }
 
+    const basePlaceTags = neighborhoods[feature.properties.placeID]?.tags;
+    finalFeature.isTerminal = !!(basePlaceTags && (basePlaceTags.aeroway === 'terminal' || basePlaceTags['subwaybuilder:is_terminal'] === 'true'));
+
     finalVoronoiMetadata[feature.properties.placeID] = finalFeature;
   });
 
-  const residentNeighborhoods = {};
-  const jobNeighborhoods = {};
-  const residentIdMap = {};
-  const jobIdMap = {};
+  const combinedNeighborhoods = {};
+  const combinedIdMap = {};
+  const combinedIdMapReverse = {};
   let neighborhoodConnections = [];
 
   // creating total percents and setting up final dicts
@@ -872,32 +1048,49 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
 
     const baseCenter = centersOfNeighborhoods[place.placeID];
 
-    if (place.totalPopulation > 0) {
-      const residentId = `${place.placeID}-res`;
-      residentIdMap[place.placeID] = residentId;
-      residentNeighborhoods[residentId] = {
-        id: residentId,
-        location: place.residentCentroid ?? baseCenter,
-        jobs: 0,
-        residents: place.totalPopulation,
-        popIds: [],
-        source: place.placeID,
-        kind: 'residents',
-      };
+    const basePlace = neighborhoods[place.placeID];
+    const baseTags = basePlace?.tags ? { ...basePlace.tags } : {};
+
+    const isTerminal = !!(baseTags.aeroway === 'terminal' || baseTags['subwaybuilder:is_terminal'] === 'true');
+
+    let outputId = place.placeID;
+    const outputTags = { ...baseTags };
+    outputTags['subwaybuilder:cluster-kind'] = 'mixed';
+
+    if (isTerminal) {
+      outputTags['subwaybuilder:is_terminal'] = 'true';
+      const mappedInfo = terminalMetaByPlace[place.placeID] ?? terminalLabelMapping[place.placeID] ?? terminalLabelMapping[`${place.placeID}`];
+      if (mappedInfo) {
+        outputId = mappedInfo.internalId;
+        outputTags.name = mappedInfo.name;
+        if (mappedInfo.iata) outputTags.iata = mappedInfo.iata;
+        terminalMetaByDisplay[outputId] = mappedInfo;
+        terminalMetaByPlace[place.placeID] = mappedInfo;
+      } else {
+        outputTags.name = outputTags.name || `Terminal ${terminalTicker}`;
+      }
+    } else if (outputTags.aeroway) {
+      delete outputTags.aeroway;
     }
-    if (place.totalJobs > 0) {
-      const jobId = `${place.placeID}-job`;
-      jobIdMap[place.placeID] = jobId;
-      jobNeighborhoods[jobId] = {
-        id: jobId,
-        location: place.jobCentroid ?? baseCenter,
-        jobs: place.totalJobs,
-        residents: 0,
-        popIds: [],
-        source: place.placeID,
-        kind: 'jobs',
-      };
-    }
+
+    if (!outputTags.name && baseTags?.name) outputTags.name = baseTags.name;
+
+    const location = place.jobCentroid ?? place.residentCentroid ?? baseCenter;
+    const jobDominant = !isTerminal && place.totalJobs >= place.totalPopulation * 5;
+    const jobsValue = place.totalJobs;
+    const residentsValue = (isTerminal || jobDominant) ? 0 : place.totalPopulation;
+
+    combinedNeighborhoods[outputId] = {
+      id: outputId,
+      location,
+      jobs: jobsValue,
+      residents: residentsValue,
+      popIds: [],
+      source: place.placeID,
+      tags: outputTags,
+    };
+    combinedIdMap[place.placeID] = outputId;
+    combinedIdMapReverse[outputId] = place.placeID;
   });
 
   const placeEntries = Object.values(finalVoronoiMetadata);
@@ -921,6 +1114,7 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
           jobId: innerPlace.placeID,
           weight,
           closeness,
+          isTerminal: innerPlace.isTerminal,
           distanceMeters: connectionDistance,
           drivingDistance: Math.round(connectionDistance),
           drivingSeconds: Math.round(connectionDistance * 0.12),
@@ -949,12 +1143,54 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
       if (!selectedMap.has(candidate.jobId)) selectedMap.set(candidate.jobId, candidate);
     });
 
+    const terminalCandidates = connectionCandidates.filter((candidate) => candidate.isTerminal);
+    terminalCandidates.forEach((candidate) => {
+      if (!selectedMap.has(candidate.jobId)) selectedMap.set(candidate.jobId, candidate);
+    });
+
+    const effectiveMaxConnections = Math.max(maxConnections, selectedMap.size);
+
     for (const candidate of byWeight) {
-      if (selectedMap.size >= maxConnections) break;
+      if (selectedMap.size >= effectiveMaxConnections) break;
       if (!selectedMap.has(candidate.jobId)) selectedMap.set(candidate.jobId, candidate);
     }
 
-    const limitedCandidates = Array.from(selectedMap.values());
+    let limitedCandidates = Array.from(selectedMap.values());
+
+    const computeWeights = (candidates) => {
+      let total = 0;
+      let terminal = 0;
+      candidates.forEach((candidate) => {
+        total += candidate.weight;
+        const originalId = combinedIdMapReverse[candidate.jobId];
+        if (originalId && finalVoronoiMetadata[originalId]?.isTerminal) {
+          terminal += candidate.weight;
+          candidate.isTerminal = true;
+        } else {
+          candidate.isTerminal = false;
+        }
+      });
+      return { total, terminal };
+    };
+
+    let { total: totalWeight, terminal: terminalWeight } = computeWeights(limitedCandidates);
+
+    if (terminalWeight > 0 && totalWeight > 0) {
+      const currentShare = terminalWeight / totalWeight;
+      if (currentShare > DISTANCE_WEIGHTING.terminalMaxShare || currentShare < DISTANCE_WEIGHTING.terminalMinShare) {
+        const targetShare = Math.min(
+          DISTANCE_WEIGHTING.terminalMaxShare,
+          Math.max(DISTANCE_WEIGHTING.terminalMinShare, currentShare)
+        );
+        const desiredTerminalWeight = totalWeight * targetShare;
+        const scaleFactor = desiredTerminalWeight / terminalWeight;
+        limitedCandidates = limitedCandidates.map((candidate) => {
+          if (!candidate.isTerminal) return candidate;
+          return { ...candidate, weight: Math.max(candidate.weight * scaleFactor, DISTANCE_WEIGHTING.baseWeight / 10) };
+        });
+        ({ total: totalWeight, terminal: terminalWeight } = computeWeights(limitedCandidates));
+      }
+    }
 
     let weightSum = limitedCandidates.reduce((sum, candidate) => sum + candidate.weight, 0);
     if (!weightSum || weightSum <= 0) weightSum = limitedCandidates.length;
@@ -976,6 +1212,65 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
 
     for (let i = 0; remaining > 0 && rawConnections.length > 0; i++, remaining--) {
       rawConnections[i % rawConnections.length].baseSize += 1;
+    }
+
+    const isTerminalJob = (jobId) => {
+      const originalId = combinedIdMapReverse[jobId];
+      return originalId && finalVoronoiMetadata[originalId]?.isTerminal;
+    };
+    const terminalConnections = rawConnections.filter((conn) => isTerminalJob(conn.jobId));
+    const nonTerminalConnections = rawConnections.filter((conn) => !isTerminalJob(conn.jobId));
+
+    if (terminalConnections.length && nonTerminalConnections.length) {
+      const maxTerminalTrips = Math.max(1, Math.round(totalPop * DISTANCE_WEIGHTING.terminalMaxShare));
+      const minTerminalTrips = Math.round(totalPop * DISTANCE_WEIGHTING.terminalMinShare);
+
+      let terminalTotal = terminalConnections.reduce((sum, conn) => sum + conn.baseSize, 0);
+
+      if (terminalTotal > maxTerminalTrips) {
+        let over = terminalTotal - maxTerminalTrips;
+        const sortedTerminals = [...terminalConnections].sort((a, b) => a.closeness - b.closeness);
+        let released = 0;
+        for (const conn of sortedTerminals) {
+          if (over <= 0) break;
+          const reducible = Math.min(conn.baseSize, over);
+          if (reducible <= 0) continue;
+          conn.baseSize -= reducible;
+          over -= reducible;
+          released += reducible;
+        }
+        if (released > 0) {
+          const sortedNonTerminals = [...nonTerminalConnections].sort((a, b) => b.closeness - a.closeness);
+          let idx = 0;
+          while (released > 0 && sortedNonTerminals.length) {
+            sortedNonTerminals[idx % sortedNonTerminals.length].baseSize += 1;
+            released -= 1;
+            idx += 1;
+          }
+        }
+        terminalTotal = terminalConnections.reduce((sum, conn) => sum + conn.baseSize, 0);
+      }
+
+      if (terminalTotal < minTerminalTrips) {
+        let needed = minTerminalTrips - terminalTotal;
+        if (needed > 0) {
+          const sortedNonTerminals = [...nonTerminalConnections].sort((a, b) => a.closeness - b.closeness);
+          const sortedTerminals = [...terminalConnections].sort((a, b) => b.closeness - a.closeness);
+          let idx = 0;
+          while (needed > 0 && sortedNonTerminals.length) {
+            const donor = sortedNonTerminals[idx % sortedNonTerminals.length];
+            if (donor.baseSize <= 1) {
+              idx += 1;
+              if (idx > sortedNonTerminals.length * 2) break;
+              continue;
+            }
+            donor.baseSize -= 1;
+            sortedTerminals[idx % sortedTerminals.length].baseSize += 1;
+            needed -= 1;
+            idx += 1;
+          }
+        }
+      }
     }
 
     if (POPULATION_GROUP_CONFIG.minimumFinalizeSize) {
@@ -1025,15 +1320,11 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
       const groupSizes = splitConnectionIntoGroups(conn.baseSize, conn.residenceId, conn.jobId);
       groupSizes.forEach((groupSize) => {
         const id = (connectionCounter++).toString();
-        const residentNodeId = residentIdMap[conn.residenceId];
-        const jobNodeId = jobIdMap[conn.jobId];
+        const residentNodeId = combinedIdMap[conn.residenceId];
+        const jobNodeId = combinedIdMap[conn.jobId];
         if (!residentNodeId || !jobNodeId) return;
-        if (residentNeighborhoods[residentNodeId]) {
-          residentNeighborhoods[residentNodeId].popIds.push(id);
-        }
-        if (jobNeighborhoods[jobNodeId]) {
-          jobNeighborhoods[jobNodeId].popIds.push(id);
-        }
+        if (combinedNeighborhoods[residentNodeId]) combinedNeighborhoods[residentNodeId].popIds.push(id);
+        if (combinedNeighborhoods[jobNodeId]) combinedNeighborhoods[jobNodeId].popIds.push(id);
         neighborhoodConnections.push({
           residenceId: residentNodeId,
           jobId: jobNodeId,
@@ -1046,12 +1337,87 @@ const processPlaceConnections = (place, rawBuildings, rawPlaces) => {
     });
   });
 
+  const totalTerminalTrips = neighborhoodConnections
+    .filter((conn) => {
+      const originalId = combinedIdMapReverse[conn.jobId];
+      return originalId && finalVoronoiMetadata[originalId]?.isTerminal;
+    })
+    .reduce((sum, conn) => sum + conn.size, 0);
+
+  const globalTerminalCap = Math.round(totalPopulation * DISTANCE_WEIGHTING.globalTerminalShare);
+
+  if (totalTerminalTrips > globalTerminalCap) {
+    let over = totalTerminalTrips - globalTerminalCap;
+    const terminalConnectionsDescending = neighborhoodConnections
+      .map((conn, index) => ({ conn, index }))
+      .filter(({ conn }) => {
+        const originalId = combinedIdMapReverse[conn.jobId];
+        return originalId && finalVoronoiMetadata[originalId]?.isTerminal;
+      })
+      .sort((a, b) => b.conn.size - a.conn.size);
+
+    terminalConnectionsDescending.forEach(({ conn, index }) => {
+      if (over <= 0) return;
+      const reducible = Math.min(conn.size - 1, over);
+      if (reducible <= 0) return;
+      neighborhoodConnections[index].size -= reducible;
+      over -= reducible;
+    });
+  }
+
+  const terminalGroupMap = {};
+  neighborhoodConnections.forEach((conn, index) => {
+    const originalId = combinedIdMapReverse[conn.jobId];
+    if (!originalId || !finalVoronoiMetadata[originalId]?.isTerminal) return;
+    const meta = terminalMetaByDisplay[conn.jobId] || terminalMetaByPlace[originalId] || {};
+    const groupKey = meta.iata || meta.displayName || originalId;
+    if (!terminalGroupMap[groupKey]) terminalGroupMap[groupKey] = { indices: [], total: 0 };
+    terminalGroupMap[groupKey].indices.push(index);
+    terminalGroupMap[groupKey].total += neighborhoodConnections[index].size;
+  });
+
+  const updatedTerminalTotal = Object.values(terminalGroupMap).reduce((sum, group) => sum + group.total, 0);
+
+  if (updatedTerminalTotal > 0) {
+    Object.entries(terminalGroupMap).forEach(([key, group]) => {
+      const desired = Math.round(globalTerminalCap * (group.total / updatedTerminalTotal));
+      if (group.total > desired) {
+        let over = group.total - desired;
+        const sorted = group.indices
+          .map((index) => ({ index, conn: neighborhoodConnections[index] }))
+          .sort((a, b) => a.conn.closeness - b.conn.closeness);
+        for (const item of sorted) {
+          if (over <= 0) break;
+          const reducible = Math.min(neighborhoodConnections[item.index].size - 1, over);
+          if (reducible <= 0) continue;
+          neighborhoodConnections[item.index].size -= reducible;
+          over -= reducible;
+        }
+      }
+    });
+  }
+
+  const finalPoints = Object.values(combinedNeighborhoods)
+    .map((point) => {
+      const originalId = combinedIdMapReverse[point.id];
+      const metadata = originalId ? finalVoronoiMetadata[originalId] : null;
+      if (metadata?.isTerminal) {
+        return {
+          ...point,
+          residents: 0,
+          tags: {
+            ...point.tags,
+            'subwaybuilder:is_terminal': 'true',
+          },
+        };
+      }
+      return point;
+    })
+    .filter((point) => point.jobs > 0 || point.residents > 0);
+
   return {
-    points: [
-      ...Object.values(residentNeighborhoods),
-      ...Object.values(jobNeighborhoods),
-    ],
-    pops: neighborhoodConnections,
+    points: finalPoints,
+    pops: neighborhoodConnections.filter((conn) => conn.size > 0),
   }
 };
 
