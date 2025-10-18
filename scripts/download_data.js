@@ -5,12 +5,17 @@ import config from '../config.js';
 
 const OVERPASS_ENDPOINTS = [
   "https://overpass-api.de/api/interpreter",
+  "https://z.overpass-api.de/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
-  "https://overpass.openstreetmap.ru/cgi/interpreter",
+  "https://overpass.osm.ch/api/interpreter",
   "https://overpass.openstreetmap.fr/api/interpreter",
+  "https://overpass.openstreetmap.ru/cgi/interpreter",
+  "https://overpass.nchc.org.tw/api/interpreter",
 ];
 
-const REQUEST_TIMEOUT_MS = 10000; // Abort slow mirrors
+const parsedTimeout = Number.parseInt(process.env.OVERPASS_REQUEST_TIMEOUT_MS ?? '', 10);
+const REQUEST_TIMEOUT_MS = Number.isNaN(parsedTimeout) ? 90000 : parsedTimeout; // Abort slow mirrors while still allowing long queries.
+const RETRY_DELAYS_MS = [0, 5000, 15000]; // Backoff between full mirror sweeps.
 
 const convertBbox = (bbox) => [bbox[1], bbox[0], bbox[3], bbox[2]];
 
@@ -35,6 +40,8 @@ const fetchWithTimeout = async (endpoint, query) => {
     clearTimeout(timer);
   }
 };
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const parseJsonStream = (response) => new Promise((resolve, reject) => {
   const parseStream = createParseStream();
@@ -84,13 +91,25 @@ const runQueryAgainstEndpoint = async (endpoint, query) => {
 
 const runQuery = async (query) => {
   let lastError = null;
+  const endpoints = [...OVERPASS_ENDPOINTS];
 
-  for (const endpoint of OVERPASS_ENDPOINTS) {
-    try {
-      return await runQueryAgainstEndpoint(endpoint, query);
-    } catch (error) {
-      lastError = error;
-      console.warn(`Mirror failed (${endpoint}): ${error.message}`);
+  for (let attempt = 0; attempt < RETRY_DELAYS_MS.length; attempt += 1) {
+    const delay = RETRY_DELAYS_MS[attempt];
+    if (delay > 0) {
+      console.log(`Retrying Overpass mirrors in ${delay / 1000}s...`);
+      await sleep(delay);
+      if (endpoints.length > 1) {
+        endpoints.push(endpoints.shift());
+      }
+    }
+
+    for (const endpoint of endpoints) {
+      try {
+        return await runQueryAgainstEndpoint(endpoint, query);
+      } catch (error) {
+        lastError = error;
+        console.warn(`Mirror failed (${endpoint}): ${error.message}`);
+      }
     }
   }
 
@@ -274,6 +293,13 @@ const fetchAllData = async (place) => {
 };
 
 if (!fs.existsSync('./raw_data')) fs.mkdirSync('./raw_data');
-config.places.forEach((place) => {
-  fetchAllData(place);
+const fetchAllPlacesSequentially = async () => {
+  for (const place of config.places) {
+    await fetchAllData(place);
+  }
+};
+
+fetchAllPlacesSequentially().catch((error) => {
+  console.error('Unexpected error while fetching places:', error);
+  process.exit(1);
 });
