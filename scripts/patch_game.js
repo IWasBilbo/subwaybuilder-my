@@ -3,6 +3,12 @@ import config from '../config.js';
 import { execSync } from 'child_process';
 
 const ENABLE_DEV_TOOLS = false;
+const [NODE_MAJOR = 0, NODE_MINOR = 0] = process.versions.node
+  .split('.')
+  .map((value) => Number.parseInt(value, 10));
+const ASAR_PACKAGE = (NODE_MAJOR > 22 || (NODE_MAJOR === 22 && NODE_MINOR >= 12))
+  ? '@electron/asar'
+  : '@electron/asar@3';
 
 if (fs.existsSync('./patching_working_directory')) fs.rmSync('./patching_working_directory', { force: true, recursive: true, });
 fs.mkdirSync('./patching_working_directory');
@@ -43,7 +49,7 @@ if (config.platform == 'linux') {
 };
 
 console.log('Extracting asar contents')
-execSync(`npx @electron/asar extract ${import.meta.dirname}/../patching_working_directory/squashfs-root/resources/app.asar ${import.meta.dirname}/../patching_working_directory/extracted-asar`)
+execSync(`npx ${ASAR_PACKAGE} extract ${import.meta.dirname}/../patching_working_directory/squashfs-root/resources/app.asar ${import.meta.dirname}/../patching_working_directory/extracted-asar`)
 
 console.log('Locating main.js');
 const shouldBeMainJS = import.meta.dirname + '/../patching_working_directory/extracted-asar/dist/main/main.js';
@@ -67,11 +73,80 @@ if (ENABLE_DEV_TOOLS) {
 
 console.log('Extracting existing list of cities')
 const indexJSContents = fs.readFileSync(`${import.meta.dirname}/../patching_working_directory/extracted-asar/dist/renderer/public/${shouldBeIndexJS[0]}`, { encoding: 'utf8' });
-const startOfCitiesArea = indexJSContents.indexOf('const cities = [{') + 'const cities = '.length; // will give us the start of the array
-const endOfCitiesArea = indexJSContents.indexOf('}];', startOfCitiesArea) + 2;
-if (startOfCitiesArea == -1 || endOfCitiesArea == -1) triggerError('code-not-found', 'The list of cities could not be located.');
+const citiesRegex = /const cities = (\[\{[\s\S]*?\}\]);/;
+const citiesMatch = citiesRegex.exec(indexJSContents);
+if (!citiesMatch) triggerError('code-not-found', 'The list of cities could not be located.');
+const citiesArraySource = citiesMatch[1];
+const startOfCitiesArea = citiesMatch.index + 'const cities = '.length;
+const endOfCitiesArea = startOfCitiesArea + citiesArraySource.length - 1;
 
-const existingListOfCities = JSON.parse(indexJSContents.substring(startOfCitiesArea, endOfCitiesArea));
+const extractFunctionSource = (source, name) => {
+  if (!name) return null;
+  const fnIndex = source.indexOf(`function ${name}(`);
+  if (fnIndex === -1) return null;
+  const startBrace = source.indexOf('{', fnIndex);
+  if (startBrace === -1) return null;
+  let depth = 0;
+  for (let i = startBrace; i < source.length; i += 1) {
+    const char = source[i];
+    if (char === '{') depth += 1;
+    else if (char === '}') {
+      depth -= 1;
+      if (depth === 0) return source.slice(fnIndex, i + 1);
+    }
+  }
+  return null;
+};
+
+let existingListOfCities;
+try {
+  existingListOfCities = JSON.parse(citiesArraySource);
+} catch (plainParseError) {
+  const obfuscatedCallMatch = citiesArraySource.match(/(_0x[a-f0-9]+)\((\d+)\)/i);
+  if (!obfuscatedCallMatch) {
+    console.error(plainParseError);
+    triggerError('code-not-found', 'Failed to parse the existing city list.');
+  }
+
+  const aliasName = obfuscatedCallMatch[1];
+  const aliasDefinitionRegex = new RegExp(`const\\s+${aliasName}\\s*=\\s*(_0x[a-f0-9]+);`, 'i');
+  const aliasDefinitionMatch = aliasDefinitionRegex.exec(indexJSContents);
+  const baseFunctionName = aliasDefinitionMatch ? aliasDefinitionMatch[1] : aliasName;
+  const baseFunctionSource = extractFunctionSource(indexJSContents, baseFunctionName);
+  if (!baseFunctionSource) triggerError('code-not-found', 'Failed to locate obfuscated city decoder.');
+
+  let helperFunctionSource = null;
+  const helperMatch = baseFunctionSource.match(/=\s*(_0x[a-f0-9]+)\(\)/i);
+  if (helperMatch) {
+    helperFunctionSource = extractFunctionSource(indexJSContents, helperMatch[1]);
+  }
+
+  const scriptParts = [];
+  if (helperFunctionSource) scriptParts.push(helperFunctionSource);
+  scriptParts.push(baseFunctionSource);
+  if (aliasName !== baseFunctionName) scriptParts.push(`const ${aliasName} = ${baseFunctionName};`);
+
+  let decodeFn;
+  try {
+    decodeFn = Function(`${scriptParts.join('\n')}\nreturn ${aliasName};`)();
+  } catch (decoderError) {
+    console.error(decoderError);
+    triggerError('code-not-found', 'Failed to evaluate the obfuscated city decoder.');
+  }
+
+  const decodePattern = new RegExp(`(?:${aliasName}|${baseFunctionName})\\((\\d+)\\)`, 'g');
+  const decodedArrayText = citiesArraySource.replace(decodePattern, (_match, num) => {
+    const decodedValue = decodeFn(Number(num));
+    return JSON.stringify(decodedValue);
+  });
+
+  try {
+    existingListOfCities = JSON.parse(decodedArrayText);
+  } catch (decodedParseError) {
+    console.error(decodedParseError);
+    triggerError('code-not-found', 'Failed to decode the existing city list.');
+  }
+}
 console.log('Modifying existing list of cities and writing placeholder city maps');
 existingListOfCities.push(...config.places.map((place) => {
   fs.cpSync(`${import.meta.dirname}/../placeholder_mapimage.svg`, `${import.meta.dirname}/../patching_working_directory/extracted-asar/dist/renderer/city-maps/${place.code.toLowerCase()}.svg`);
@@ -89,7 +164,7 @@ existingListOfCities.push(...config.places.map((place) => {
   }
 }));
 console.log('Writing to index.js')
-const indexAfterCitiesMod = stringReplaceAt(indexJSContents, startOfCitiesArea, endOfCitiesArea, JSON.stringify(existingListOfCities) + ';');
+const indexAfterCitiesMod = stringReplaceAt(indexJSContents, startOfCitiesArea, endOfCitiesArea, JSON.stringify(existingListOfCities));
 fs.writeFileSync(`${import.meta.dirname}/../patching_working_directory/extracted-asar/dist/renderer/public/${shouldBeIndexJS[0]}`, indexAfterCitiesMod, { 'encoding': 'utf-8' });
 
 console.log('Extracting existing map config')
@@ -129,7 +204,7 @@ fs.writeFileSync(`${import.meta.dirname}/../patching_working_directory/extracted
 
 // i can do this programmatically but it was seemingly async, which I can't deal with rn
 console.log('Repacking asar contents');
-execSync(`npx @electron/asar pack ${import.meta.dirname}/../patching_working_directory/extracted-asar ${import.meta.dirname}/../patching_working_directory/squashfs-root/resources/app.asar`)
+execSync(`npx ${ASAR_PACKAGE} pack ${import.meta.dirname}/../patching_working_directory/extracted-asar ${import.meta.dirname}/../patching_working_directory/squashfs-root/resources/app.asar`)
 
 console.log('Copying over maps and compressing (if needed)');
 config.places.forEach((place) => {
